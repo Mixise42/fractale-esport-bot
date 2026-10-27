@@ -1168,6 +1168,93 @@ async def tournoi_joueurs(interaction: discord.Interaction, tournoi_id: app_comm
     await interaction.response.send_message(embed=embed, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
 
 
+@bot.tree.command(name="tournoi_retirer", description="Retirer un joueur inscrit par erreur à un tournoi.")
+@app_commands.describe(
+    tournoi_id="Numéro du tournoi",
+    joueur="Joueur à retirer de la liste des inscrits"
+)
+@moderator_only()
+async def tournoi_retirer(
+    interaction: discord.Interaction,
+    tournoi_id: app_commands.Range[int, 1, 2147483647],
+    joueur: discord.Member
+):
+    if interaction.guild_id is None:
+        await interaction.response.send_message(
+            "Cette commande doit être utilisée sur un serveur.", ephemeral=True
+        )
+        return
+
+    tournament = db.execute(
+        "SELECT id, name, status, message_id FROM fe_tournaments WHERE id = ? AND guild_id = ?",
+        (tournoi_id, interaction.guild_id)
+    ).fetchone()
+    if tournament is None:
+        await interaction.response.send_message(
+            "Je ne trouve pas ce tournoi sur ce serveur.", ephemeral=True
+        )
+        return
+
+    if tournament["status"] != "open":
+        await interaction.response.send_message(
+            "Les inscriptions sont fermées : impossible de retirer un joueur de ce tournoi.",
+            ephemeral=True
+        )
+        return
+
+    registered = db.execute(
+        "SELECT 1 FROM fe_tournament_players WHERE tournament_id = ? AND user_id = ?",
+        (tournoi_id, joueur.id)
+    ).fetchone()
+    if registered is None:
+        await interaction.response.send_message(
+            f"{joueur.mention} n'est pas inscrit au tournoi **{tournament['name']}** (#{tournoi_id}).",
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none()
+        )
+        return
+
+    db.execute(
+        "DELETE FROM fe_tournament_players WHERE tournament_id = ? AND user_id = ?",
+        (tournoi_id, joueur.id)
+    )
+    db.commit()
+    count = tournament_player_count(tournoi_id)
+
+    # Actualise le nombre de joueurs sur le message du tournoi, si possible.
+    if tournament["message_id"]:
+        message = None
+        for channel in interaction.guild.text_channels:
+            try:
+                message = await channel.fetch_message(int(tournament["message_id"]))
+                break
+            except (discord.Forbidden, discord.NotFound, discord.HTTPException, AttributeError, TypeError, ValueError):
+                continue
+        if message is not None and message.embeds:
+            embed = message.embeds[0]
+            for index, field in enumerate(embed.fields):
+                if field.name == "Joueurs inscrits":
+                    maximum = field.value.split("/")[-1].strip()
+                    embed.set_field_at(
+                        index,
+                        name="Joueurs inscrits",
+                        value=f"{count} / {maximum}",
+                        inline=True
+                    )
+                    break
+            try:
+                await message.edit(embed=embed, view=TournamentSignupView())
+            except (discord.Forbidden, discord.NotFound, discord.HTTPException, AttributeError):
+                pass
+
+    await interaction.response.send_message(
+        f"✅ {joueur.mention} a été retiré du tournoi **{tournament['name']}** (#{tournoi_id}). "
+        f"Il reste **{count}** joueur(s) inscrit(s).",
+        ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none()
+    )
+
+
 @bot.tree.command(name="tournoi_fermer", description="Fermer les inscriptions d'un tournoi.")
 @app_commands.describe(tournoi_id="Numéro du tournoi à fermer")
 @moderator_only()

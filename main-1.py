@@ -567,6 +567,10 @@ async def sync_commands():
 
 @bot.event
 async def on_ready():
+    if not getattr(bot, "tournament_validation_view_added", False):
+        bot.add_view(TournamentValidationView())
+        bot.tournament_validation_view_added = True
+
     if not getattr(bot, "commands_synced", False):
         await sync_commands()
         bot.commands_synced = True
@@ -1013,6 +1017,177 @@ def advance_tournament_if_ready(tournament_id: int) -> str:
         # La boucle vérifie alors automatiquement si elle est déjà terminée.
 
 
+
+# Équilibrage des équipes à partir des rôles Discord Rocket League.
+# Les membres "Moins de diamant" restent inscrits mais ne sont pas évalués.
+RANK_ROLE_VALUES = {
+    "diamant": 1,
+    "champion": 2,
+    "grand champion": 3,
+    "ssl": 4,
+}
+
+def tournament_member_rank(member: discord.Member) -> int:
+    names = {role.name.strip().casefold() for role in member.roles}
+    for role_name, value in RANK_ROLE_VALUES.items():
+        if role_name in names:
+            return value
+    return 0
+
+def balanced_tournament_teams(guild: discord.Guild, player_ids: list[int], team_size: int) -> list[list[int]]:
+    """Tirage aléatoire, puis répartition gloutonne équilibrée par somme des rangs."""
+    ranked = []
+    for user_id in player_ids:
+        member = guild.get_member(user_id)
+        if member is None:
+            rank = 0
+        else:
+            rank = tournament_member_rank(member)
+        ranked.append((user_id, rank))
+    random.shuffle(ranked)
+    # Mélange conservé en cas d'égalité, mais les niveaux élevés sont répartis en premier.
+    ranked.sort(key=lambda item: item[1], reverse=True)
+    team_count = len(ranked) // team_size
+    teams = [[] for _ in range(team_count)]
+    totals = [0] * team_count
+    for user_id, rank in ranked:
+        eligible = [i for i in range(team_count) if len(teams[i]) < team_size]
+        lowest = min(totals[i] for i in eligible)
+        choices = [i for i in eligible if totals[i] == lowest]
+        chosen = random.choice(choices)
+        teams[chosen].append(user_id)
+        totals[chosen] += rank
+    # Mélange l'ordre des joueurs à l'intérieur des équipes et l'ordre des équipes.
+    for team in teams:
+        random.shuffle(team)
+    if team_size == 1:
+        # En 1v1, les joueurs de niveau proche sont appariés ensemble.
+        teams.sort(
+            key=lambda team: tournament_member_rank(guild.get_member(team[0])) if guild.get_member(team[0]) else 0,
+            reverse=True
+        )
+    return teams
+
+def tournament_team_rank_text(guild: discord.Guild, member_ids: list[int]) -> str:
+    values = []
+    for user_id in member_ids:
+        member = guild.get_member(user_id)
+        values.append(tournament_member_rank(member) if member else 0)
+    total = sum(values)
+    return f"niveau cumulé estimé : {total}"
+
+def finalize_tournament_teams(tournament_id: int) -> str:
+    team_rows = db.execute(
+        "SELECT id FROM fe_tournament_teams WHERE tournament_id = ? ORDER BY team_no",
+        (tournament_id,)
+    ).fetchall()
+    team_ids = [int(row["id"]) for row in team_rows]
+    if len(team_ids) < 2:
+        return "Il faut au moins deux équipes pour créer les matchs."
+    create_tournament_round(tournament_id, 1, team_ids)
+    db.execute(
+        "UPDATE fe_tournaments SET status = 'closed', tournament_state = 'in_progress' WHERE id = ?",
+        (tournament_id,)
+    )
+    db.commit()
+    return "Les équipes sont validées et le tableau des matchs est créé."
+
+class TournamentValidationView(discord.ui.View):
+    """Boutons persistants : seuls fondateur, cofondateur et modérateur peuvent valider."""
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Valider les équipes", style=discord.ButtonStyle.success,
+                       emoji="✅", custom_id="fractale:tournament_validate:v1")
+    async def validate(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not isinstance(interaction.user, discord.Member) or not require_level(interaction.user, 1):
+            await interaction.response.send_message(
+                "Cette action est réservée aux modérateurs, cofondateurs et fondateurs.",
+                ephemeral=True
+            )
+            return
+        tournament_id = None
+        if interaction.message and interaction.message.embeds:
+            footer = interaction.message.embeds[0].footer.text or ""
+            match = re.search(r"Tournoi #(\d+)", footer)
+            if match:
+                tournament_id = int(match.group(1))
+        if tournament_id is None:
+            await interaction.response.send_message("Impossible d'identifier ce tournoi.", ephemeral=True)
+            return
+        row = db.execute(
+            "SELECT name, guild_id, tournament_state FROM fe_tournaments WHERE id = ?",
+            (tournament_id,)
+        ).fetchone()
+        if row is None or int(row["guild_id"]) != interaction.guild_id:
+            await interaction.response.send_message("Tournoi introuvable.", ephemeral=True)
+            return
+        if row["tournament_state"] != "pending_validation":
+            await interaction.response.send_message("Ces équipes ont déjà été traitées.", ephemeral=True)
+            return
+        result = finalize_tournament_teams(tournament_id)
+        matches = db.execute(
+            "SELECT * FROM fe_tournament_matches WHERE tournament_id = ? AND round_no = 1 ORDER BY match_no",
+            (tournament_id,)
+        ).fetchall()
+        lines = [
+            f"**Match #{m['id']}** — {tournament_team_label(m['team1_id'])} ⚔️ {tournament_team_label(m['team2_id'])}"
+            for m in matches
+        ]
+        embed = discord.Embed(
+            title=f"🏁 Équipes validées — {row['name']}",
+            description=result + ("\n\n" + "\n".join(lines) if lines else ""),
+            color=discord.Color.green()
+        )
+        embed.set_footer(text=f"Tournoi #{tournament_id} • Validation par {interaction.user.display_name}")
+        await interaction.response.edit_message(embed=embed, view=None)
+        await interaction.followup.send(
+            f"✅ Le tableau du tournoi **{row['name']}** est prêt. Utilise `/tournoi_matchs` pour le consulter.",
+            ephemeral=True
+        )
+
+    @discord.ui.button(label="Refuser les équipes", style=discord.ButtonStyle.danger,
+                       emoji="❌", custom_id="fractale:tournament_reject:v1")
+    async def reject(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not isinstance(interaction.user, discord.Member) or not require_level(interaction.user, 1):
+            await interaction.response.send_message(
+                "Cette action est réservée aux modérateurs, cofondateurs et fondateurs.",
+                ephemeral=True
+            )
+            return
+        tournament_id = None
+        if interaction.message and interaction.message.embeds:
+            footer = interaction.message.embeds[0].footer.text or ""
+            match = re.search(r"Tournoi #(\d+)", footer)
+            if match:
+                tournament_id = int(match.group(1))
+        if tournament_id is None:
+            await interaction.response.send_message("Impossible d'identifier ce tournoi.", ephemeral=True)
+            return
+        row = db.execute(
+            "SELECT name, guild_id, tournament_state FROM fe_tournaments WHERE id = ?",
+            (tournament_id,)
+        ).fetchone()
+        if row is None or int(row["guild_id"]) != interaction.guild_id:
+            await interaction.response.send_message("Tournoi introuvable.", ephemeral=True)
+            return
+        if row["tournament_state"] != "pending_validation":
+            await interaction.response.send_message("Ces équipes ont déjà été traitées.", ephemeral=True)
+            return
+        db.execute("DELETE FROM fe_tournament_teams WHERE tournament_id = ?", (tournament_id,))
+        db.execute(
+            "UPDATE fe_tournaments SET tournament_state = 'signup', status = 'open' WHERE id = ?",
+            (tournament_id,)
+        )
+        db.commit()
+        embed = discord.Embed(
+            title=f"❌ Équipes refusées — {row['name']}",
+            description="Le staff a refusé cette proposition. Les inscriptions sont de nouveau ouvertes ; le tournoi peut être relancé.",
+            color=discord.Color.red()
+        )
+        embed.set_footer(text=f"Tournoi #{tournament_id} • Refus par {interaction.user.display_name}")
+        await interaction.response.edit_message(embed=embed, view=None)
+
 class TournamentSignupView(discord.ui.View):
     """Bouton d'inscription persistant, fonctionnel après redémarrage."""
 
@@ -1286,21 +1461,22 @@ async def tournoi_fermer(interaction: discord.Interaction, tournoi_id: app_comma
     await interaction.response.send_message(f"🔒 Les inscriptions au tournoi **{row['name']}** (#{tournoi_id}) sont fermées.", ephemeral=True)
 
 
-@bot.tree.command(name="tournoi_lancer", description="Fermer les inscriptions, former les équipes et lancer le tableau.")
-@app_commands.describe(tournoi_id="Numéro du tournoi à lancer")
+@bot.tree.command(name="tournoi_lancer", description="Préparer les équipes équilibrées et demander leur validation au staff.")
+@app_commands.describe(tournoi_id="Numéro du tournoi à préparer")
 @moderator_only()
 async def tournoi_lancer(interaction: discord.Interaction, tournoi_id: app_commands.Range[int, 1, 2147483647]):
-    if interaction.guild_id is None:
+    if interaction.guild is None:
         await interaction.response.send_message("Cette commande doit être utilisée sur un serveur.", ephemeral=True)
         return
     tournament = db.execute(
-        "SELECT * FROM fe_tournaments WHERE id = ? AND guild_id = ?", (tournoi_id, interaction.guild_id)
+        "SELECT * FROM fe_tournaments WHERE id = ? AND guild_id = ?",
+        (tournoi_id, interaction.guild.id)
     ).fetchone()
     if tournament is None:
         await interaction.response.send_message("Je ne trouve pas ce tournoi sur ce serveur.", ephemeral=True)
         return
     if tournament["tournament_state"] != "signup" or tournament["status"] != "open":
-        await interaction.response.send_message("Ce tournoi a déjà été lancé ou n'est plus disponible.", ephemeral=True)
+        await interaction.response.send_message("Ce tournoi a déjà été préparé ou n'est plus disponible.", ephemeral=True)
         return
     players = db.execute(
         "SELECT user_id FROM fe_tournament_players WHERE tournament_id = ? ORDER BY joined_at ASC",
@@ -1310,45 +1486,59 @@ async def tournoi_lancer(interaction: discord.Interaction, tournoi_id: app_comma
     team_size = tournament_team_size(mode)
     player_ids = [int(row["user_id"]) for row in players]
     if len(player_ids) < team_size * 2:
-        await interaction.response.send_message(f"Il faut au moins {team_size * 2} joueurs inscrits pour lancer un tournoi {mode}.", ephemeral=True)
+        await interaction.response.send_message(
+            f"Il faut au moins {team_size * 2} joueurs inscrits pour lancer un tournoi {mode}.",
+            ephemeral=True
+        )
         return
     if len(player_ids) % team_size != 0:
         missing = team_size - (len(player_ids) % team_size)
         await interaction.response.send_message(
-            f"Il y a {len(player_ids)} joueurs inscrits, ce qui ne permet pas de former toutes les équipes de {team_size}. "
-            f"Il faut {missing} joueur(s) supplémentaire(s), ou retirer des inscriptions pour obtenir un multiple de {team_size}.", ephemeral=True
+            f"Il y a {len(player_ids)} joueurs. Il en manque {missing} pour former des équipes complètes de {team_size}.",
+            ephemeral=True
         )
         return
-    random.shuffle(player_ids)
-    team_ids = []
-    for index in range(0, len(player_ids), team_size):
-        members = player_ids[index:index + team_size]
-        team_no = index // team_size + 1
+
+    teams = balanced_tournament_teams(interaction.guild, player_ids, team_size)
+    # Nettoyage défensif d'une éventuelle proposition précédente sans toucher aux inscriptions.
+    db.execute("DELETE FROM fe_tournament_matches WHERE tournament_id = ?", (tournoi_id,))
+    db.execute("DELETE FROM fe_tournament_teams WHERE tournament_id = ?", (tournoi_id,))
+    summaries = []
+    for team_no, members in enumerate(teams, 1):
         cursor = db.execute(
             "INSERT INTO fe_tournament_teams (tournament_id, team_no, members) VALUES (?, ?, ?)",
             (tournoi_id, team_no, ",".join(str(member) for member in members))
         )
-        team_ids.append(int(cursor.lastrowid))
-    db.execute("UPDATE fe_tournaments SET status = 'closed', tournament_state = 'in_progress' WHERE id = ?", (tournoi_id,))
-    create_tournament_round(tournoi_id, 1, team_ids)
-    db.commit()
-    match_rows = db.execute(
-        "SELECT * FROM fe_tournament_matches WHERE tournament_id = ? AND round_no = 1 ORDER BY match_no",
+        mentions = ", ".join(f"<@{uid}>" for uid in members)
+        rank_total = sum(
+            tournament_member_rank(interaction.guild.get_member(uid))
+            for uid in members
+        )
+        summaries.append(f"**Équipe #{team_no}** — {mentions}\n📊 {tournament_team_rank_text(interaction.guild, members)}")
+    db.execute(
+        "UPDATE fe_tournaments SET tournament_state = 'pending_validation' WHERE id = ?",
         (tournoi_id,)
-    ).fetchall()
-    lines = []
-    for match in match_rows:
-        lines.append(f"**Match #{match['id']}** — {tournament_team_label(match['team1_id'])}  ⚔️  {tournament_team_label(match['team2_id'])}")
-    embed = discord.Embed(
-        title=f"🏁 Tournoi lancé : {tournament['name']}",
-        description=f"Format **{mode}** • {len(player_ids)} joueurs • {len(team_ids)} équipes\nLes équipes ont été tirées au sort.\n\n" + "\n".join(lines),
-        color=discord.Color.green()
     )
-    embed.set_footer(text="Le staff peut utiliser /tournoi_matchs puis /tournoi_resultat pour faire avancer le tournoi.")
-    await interaction.response.send_message(embed=embed, allowed_mentions=discord.AllowedMentions.none())
-    state_message = advance_tournament_if_ready(tournoi_id)
-    if "Tournoi terminé" in state_message:
-        await interaction.followup.send(state_message, allowed_mentions=discord.AllowedMentions.none())
+    db.commit()
+
+    embed = discord.Embed(
+        title=f"🧩 Proposition d'équipes — {tournament['name']}",
+        description=(
+            f"Format **{mode}** • {len(player_ids)} joueurs • {len(teams)} équipes\n"
+            "Répartition aléatoire avec équilibrage par catégorie de rang Discord.\n"
+            "Les catégories prises en compte sont Diamant, Champion, Grand Champion et SSL. "
+            "« Moins de diamant » n'est pas évalué.\n\n"
+            + "\n\n".join(summaries)
+            + "\n\n⏳ **En attente de validation du staff.** Aucun match ne sera créé avant validation."
+        )[:4000],
+        color=discord.Color.gold()
+    )
+    embed.set_footer(text=f"Tournoi #{tournoi_id}")
+    await interaction.response.send_message(
+        embed=embed,
+        view=TournamentValidationView(),
+        allowed_mentions=discord.AllowedMentions.none()
+    )
 
 
 @bot.tree.command(name="tournoi_matchs", description="Afficher les matchs et les équipes d'un tournoi.")
@@ -2888,7 +3078,7 @@ async def aide(interaction: discord.Interaction):
             "`/tournoi_liste` — Voir les tournois ouverts\n"
             "`/tournoi_joueurs` — Voir les inscrits\n"
             "`/tournoi_fermer` — Fermer les inscriptions (staff)\n"
-            "`/tournoi_lancer` — Tirer les équipes au sort et lancer le tournoi (staff)\n"
+            "`/tournoi_lancer` — Proposer des équipes équilibrées à valider par le staff\n"
             "`/tournoi_matchs` — Voir le tableau et les matchs\n"
             "`/tournoi_resultat` — Enregistrer le vainqueur d’un match (staff)"
         ),
@@ -7175,7 +7365,10 @@ async def traiter_recours(interaction: discord.Interaction, recours_id: int, dec
     )
 
 
-@bot.tree.command(name="recours_accepter", description="Accepter un recours et lever la sanction si elle est encore active.")
+recours_group = app_commands.Group(name="recours", description="Traiter les recours compétitifs")
+
+
+@recours_group.command(name="accepter", description="Accepter un recours et lever la sanction si elle est encore active.")
 @app_commands.describe(recours_id="Numéro affiché dans /recours_liste", motif="Justification de la décision")
 @moderator_only()
 async def recours_accepter(
@@ -7186,7 +7379,7 @@ async def recours_accepter(
     await traiter_recours(interaction, int(recours_id), "accepted", motif)
 
 
-@bot.tree.command(name="recours_refuser", description="Refuser un recours compétitif.")
+@recours_group.command(name="refuser", description="Refuser un recours compétitif.")
 @app_commands.describe(recours_id="Numéro affiché dans /recours_liste", motif="Justification de la décision")
 @moderator_only()
 async def recours_refuser(
@@ -7200,6 +7393,10 @@ async def recours_refuser(
 # ============================================================
 # DÉMARRAGE DU BOT — À LA FIN DU FICHIER
 # ============================================================
+
+# Regroupe accepter/refuser sous une seule commande principale pour respecter la limite Discord.
+bot.tree.add_command(recours_group)
+
 
 if __name__ == "__main__":
     # Le bouton reste utilisable après le redémarrage du bot.

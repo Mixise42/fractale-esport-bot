@@ -1,7 +1,9 @@
 import os
 import random
+import re
 import sqlite3
 import time
+from collections import defaultdict, deque
 from datetime import timedelta, time as datetime_time
 from zoneinfo import ZoneInfo
 
@@ -24,6 +26,12 @@ LOG_CHANNEL_ID = os.getenv("LOG_CHANNEL_ID", "")
 REPORT_CHANNEL_ID = os.getenv("REPORT_CHANNEL_ID", "")
 EVENING_CHANNEL_ID = os.getenv("EVENING_CHANNEL_ID", "")
 
+# Anti-raid autonome : seuils configurables dans le fichier .env.
+ANTI_RAID_SEUIL = max(3, int(os.getenv("ANTI_RAID_SEUIL", "6")))
+ANTI_RAID_FENETRE = max(5, int(os.getenv("ANTI_RAID_FENETRE", "20")))
+ANTI_RAID_DUREE = max(60, int(os.getenv("ANTI_RAID_DUREE", "300")))
+ANTI_RAID_SLOWMODE = min(21600, max(2, int(os.getenv("ANTI_RAID_SLOWMODE", "5"))))
+
 MODERATOR_ROLE_ID = int(os.getenv("MODERATOR_ROLE_ID", "0"))
 CO_FOUNDER_ROLE_ID = int(os.getenv("CO_FOUNDER_ROLE_ID", "0"))
 FOUNDER_ROLE_ID = int(os.getenv("FOUNDER_ROLE_ID", "0"))
@@ -37,6 +45,31 @@ MODERATION_MOTS_INTERDITS = [
     for mot in os.getenv("MODERATION_MOTS_INTERDITS", "").split(",")
     if mot.strip()
 ]
+
+# Les liens ne sont autorisés que dans les salons dont les IDs sont listés
+# dans SALONS_LIENS_AUTORISES (IDs séparés par des virgules dans .env).
+def _parse_channel_ids(raw_value: str) -> set[int]:
+    channel_ids: set[int] = set()
+    for value in raw_value.split(","):
+        value = value.strip()
+        if not value:
+            continue
+        try:
+            channel_ids.add(int(value))
+        except ValueError:
+            print(f"[SECURITE] ID de salon invalide ignoré dans SALONS_LIENS_AUTORISES : {value!r}")
+    return channel_ids
+
+SALONS_LIENS_AUTORISES = _parse_channel_ids(
+    os.getenv("SALONS_LIENS_AUTORISES", "")
+)
+
+# Détecte les URL complètes, www et domaines écrits sans protocole.
+URL_PATTERN = re.compile(
+    r"(?i)(?<![@\w])(?:https?://|www\.)[^\s<>]+"
+    r"|(?<![@\w])(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}(?:/[^\s<>]*)?"
+)
+
 MAX_REASON_LENGTH = 500
 MAX_SUGGESTION_LENGTH = 500
 
@@ -150,6 +183,16 @@ CREATE TABLE IF NOT EXISTS auto_moderation_incidents (
 );
 CREATE INDEX IF NOT EXISTS idx_auto_mod_user_time
 ON auto_moderation_incidents(guild_id, user_id, created_at);
+
+CREATE TABLE IF NOT EXISTS anti_raid_channel_state (
+    guild_id INTEGER NOT NULL,
+    channel_id INTEGER NOT NULL,
+    original_slowmode INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    PRIMARY KEY (guild_id, channel_id)
+);
+CREATE INDEX IF NOT EXISTS idx_anti_raid_expiry
+ON anti_raid_channel_state(expires_at);
 
 CREATE TABLE IF NOT EXISTS teammate_searches (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -493,6 +536,8 @@ db.commit()
 # ============================================================
 
 intents = discord.Intents.default()
+# Nécessaire pour détecter les arrivées de membres (anti-raid).
+intents.members = True
 # Nécessaire pour analyser le contenu des messages. Active aussi
 # "Message Content Intent" dans le portail développeur Discord.
 intents.message_content = True
@@ -565,8 +610,141 @@ async def sync_commands():
 # CONNEXION DU BOT
 # ============================================================
 
+# ============================================================
+# ANTI-RAID AUTONOME
+# ============================================================
+
+_raid_join_times: dict[int, deque[float]] = defaultdict(deque)
+_raid_active_until: dict[int, int] = {}
+
+
+async def activate_raid_protection(guild: discord.Guild, reason: str):
+    """Active temporairement le slowmode et mémorise les valeurs d'origine."""
+    now = int(time.time())
+    expires_at = now + ANTI_RAID_DUREE
+    previous_expiry = _raid_active_until.get(guild.id, 0)
+    _raid_active_until[guild.id] = max(previous_expiry, expires_at)
+
+    for channel in guild.text_channels:
+        try:
+            # Ne modifie pas les salons archivés/non accessibles au bot.
+            if channel.permissions_for(guild.me).manage_channels is False:
+                continue
+            db.execute(
+                "INSERT OR IGNORE INTO anti_raid_channel_state "
+                "(guild_id, channel_id, original_slowmode, expires_at) VALUES (?, ?, ?, ?)",
+                (guild.id, channel.id, int(channel.slowmode_delay), expires_at),
+            )
+            db.execute(
+                "UPDATE anti_raid_channel_state SET expires_at = ? WHERE guild_id = ? AND channel_id = ?",
+                (expires_at, guild.id, channel.id),
+            )
+            db.commit()
+            if channel.slowmode_delay < ANTI_RAID_SLOWMODE:
+                await channel.edit(
+                    slowmode_delay=ANTI_RAID_SLOWMODE,
+                    reason="Protection anti-raid automatique : arrivée massive de membres",
+                )
+        except (discord.Forbidden, discord.HTTPException):
+            continue
+
+    await send_log(
+        guild,
+        "🚨 Protection anti-raid activée automatiquement",
+        bot.user,
+        None,
+        f"{reason} Mode de sécurité actif pendant environ {ANTI_RAID_DUREE} secondes. "
+        f"Slowmode appliqué : {ANTI_RAID_SLOWMODE} secondes. Aucun membre n'est banni automatiquement.",
+    )
+    print(f"[ANTI-RAID] Protection activée sur {guild.name} ({guild.id}) jusqu'à {expires_at}.")
+
+
+@bot.event
+async def on_member_join(member: discord.Member):
+    """Détecte un pic d'arrivées et déclenche automatiquement une protection temporaire."""
+    now_float = time.time()
+    joins = _raid_join_times[member.guild.id]
+    while joins and now_float - joins[0] > ANTI_RAID_FENETRE:
+        joins.popleft()
+    joins.append(now_float)
+
+    # Pas de sanction individuelle : le bot ralentit temporairement les salons.
+    if len(joins) >= ANTI_RAID_SEUIL:
+        now = int(now_float)
+        active_until = _raid_active_until.get(member.guild.id, 0)
+        if active_until <= now:
+            await activate_raid_protection(
+                member.guild,
+                f"{len(joins)} arrivées détectées en {ANTI_RAID_FENETRE} secondes (seuil : {ANTI_RAID_SEUIL}).",
+            )
+        else:
+            # Une nouvelle vague prolonge la protection existante.
+            new_expiry = now + ANTI_RAID_DUREE
+            _raid_active_until[member.guild.id] = new_expiry
+            db.execute(
+                "UPDATE anti_raid_channel_state SET expires_at = ? WHERE guild_id = ?",
+                (new_expiry, member.guild.id),
+            )
+            db.commit()
+
+
+@tasks.loop(seconds=30)
+async def anti_raid_restore_expired():
+    """Restaure le slowmode initial une fois la période de protection terminée."""
+    now = int(time.time())
+    rows = db.execute(
+        "SELECT guild_id, channel_id, original_slowmode FROM anti_raid_channel_state WHERE expires_at <= ?",
+        (now,),
+    ).fetchall()
+    for row in rows:
+        guild = bot.get_guild(int(row["guild_id"]))
+        if guild is not None:
+            channel = guild.get_channel(int(row["channel_id"]))
+            if isinstance(channel, discord.TextChannel):
+                try:
+                    # Ne restaure que si le slowmode est encore celui imposé par l'anti-raid.
+                    if channel.slowmode_delay == ANTI_RAID_SLOWMODE:
+                        await channel.edit(
+                            slowmode_delay=int(row["original_slowmode"]),
+                            reason="Fin de la protection anti-raid automatique",
+                        )
+                except (discord.Forbidden, discord.HTTPException):
+                    pass
+        db.execute(
+            "DELETE FROM anti_raid_channel_state WHERE guild_id = ? AND channel_id = ?",
+            (int(row["guild_id"]), int(row["channel_id"])),
+        )
+        db.commit()
+        if not db.execute(
+            "SELECT 1 FROM anti_raid_channel_state WHERE guild_id = ? LIMIT 1",
+            (int(row["guild_id"]),),
+        ).fetchone():
+            _raid_active_until.pop(int(row["guild_id"]), None)
+            if guild is not None:
+                await send_log(
+                    guild,
+                    "🟢 Protection anti-raid terminée",
+                    bot.user,
+                    None,
+                    "La durée de protection est écoulée. Les slowmodes d'origine ont été restaurés lorsque possible.",
+                )
+
+
+@anti_raid_restore_expired.before_loop
+async def before_anti_raid_restore():
+    await bot.wait_until_ready()
+
+
 @bot.event
 async def on_ready():
+    print(
+        "[SECURITE] Liens autorisés dans les salons : "
+        + (", ".join(str(channel_id) for channel_id in sorted(SALONS_LIENS_AUTORISES))
+           if SALONS_LIENS_AUTORISES else "aucun salon configuré (liens bloqués partout)")
+    )
+    if not anti_raid_restore_expired.is_running():
+        anti_raid_restore_expired.start()
+
     if not getattr(bot, "tournament_validation_view_added", False):
         bot.add_view(TournamentValidationView())
         bot.tournament_validation_view_added = True
@@ -578,6 +756,11 @@ async def on_ready():
     # Démarre les événements automatiques du soir.
     if not evenement_du_soir.is_running():
         evenement_du_soir.start()
+
+    print(
+        f"[ANTI-RAID] Seuil : {ANTI_RAID_SEUIL} arrivées / {ANTI_RAID_FENETRE}s ; "
+        f"protection : {ANTI_RAID_DUREE}s ; slowmode : {ANTI_RAID_SLOWMODE}s."
+    )
 
     print(
         f"Bot connecté : {bot.user} "
@@ -3427,9 +3610,12 @@ async def on_message(message: discord.Message):
     if normalized and len([item for item in recent if item[1] == normalized]) >= 5:
         reason = "Spam : message répété plusieurs fois en quelques secondes."
 
-    # Les invitations Discord sont retirées pour limiter la publicité non sollicitée.
-    if reason is None and ("discord.gg/" in normalized or "discord.com/invite/" in normalized):
-        reason = "Lien d'invitation Discord non autorisé dans les messages."
+    # Politique des liens : ils sont autorisés uniquement dans les salons
+    # explicitement configurés. Si aucun salon n'est configuré, ils sont
+    # bloqués partout par défaut (sécurité fail-closed).
+    contains_link = bool(URL_PATTERN.search(content))
+    if reason is None and contains_link and message.channel.id not in SALONS_LIENS_AUTORISES:
+        reason = "Lien non autorisé dans ce salon. Les liens sont réservés aux salons prévus à cet effet."
 
     # Filtre facultatif configurable par le propriétaire dans le fichier .env.
     if reason is None and MODERATION_MOTS_INTERDITS:
@@ -7405,3 +7591,5 @@ if __name__ == "__main__":
         bot.run(TOKEN)
     finally:
         db.close()
+
+    

@@ -3,6 +3,7 @@ import random
 import re
 import sqlite3
 import time
+import unicodedata
 from collections import defaultdict, deque
 from datetime import timedelta, time as datetime_time
 from zoneinfo import ZoneInfo
@@ -26,11 +27,25 @@ LOG_CHANNEL_ID = os.getenv("LOG_CHANNEL_ID", "")
 REPORT_CHANNEL_ID = os.getenv("REPORT_CHANNEL_ID", "")
 EVENING_CHANNEL_ID = os.getenv("EVENING_CHANNEL_ID", "")
 
+# Salon de l'assistant FAQ Fractale. Laisse vide pour désactiver cette fonction.
+def _parse_optional_channel_id(raw_value: str, variable_name: str) -> int:
+    value = (raw_value or "").strip()
+    if not value:
+        return 0
+    try:
+        return int(value)
+    except ValueError:
+        print(f"[ASSISTANT] {variable_name} invalide : {value!r}. Fonction désactivée.")
+        return 0
+
+AI_CHANNEL_ID = _parse_optional_channel_id(os.getenv("AI_CHANNEL_ID", ""), "AI_CHANNEL_ID")
+
 # Anti-raid autonome : seuils configurables dans le fichier .env.
 ANTI_RAID_SEUIL = max(3, int(os.getenv("ANTI_RAID_SEUIL", "6")))
 ANTI_RAID_FENETRE = max(5, int(os.getenv("ANTI_RAID_FENETRE", "20")))
 ANTI_RAID_DUREE = max(60, int(os.getenv("ANTI_RAID_DUREE", "300")))
 ANTI_RAID_SLOWMODE = min(21600, max(2, int(os.getenv("ANTI_RAID_SLOWMODE", "5"))))
+ANTI_MENTION_MAX = max(2, int(os.getenv("ANTI_MENTION_MAX", "5")))
 
 MODERATOR_ROLE_ID = int(os.getenv("MODERATOR_ROLE_ID", "0"))
 CO_FOUNDER_ROLE_ID = int(os.getenv("CO_FOUNDER_ROLE_ID", "0"))
@@ -3530,6 +3545,110 @@ async def traiter_signalement_competitif(
 # Les messages identiques répétés rapidement sont traités comme du spam.
 _recent_messages: dict[tuple[int, int], list[tuple[float, str]]] = {}
 
+# Assistant Fractale - première version gratuite, sans API externe.
+# Il répond uniquement avec des informations préparées à l'avance (FAQ),
+# et ne prétend pas être une IA générative.
+_ai_last_answer: dict[tuple[int, int], float] = {}
+AI_COOLDOWN_SECONDS = 10
+
+def _normalize_faq_text(value: str) -> str:
+    value = unicodedata.normalize("NFKD", value.casefold())
+    value = "".join(char for char in value if not unicodedata.combining(char))
+    return " ".join(value.split())
+
+
+def _fractale_faq_answer(question: str) -> str:
+    q = _normalize_faq_text(question)
+
+    # Les questions sont classées par mots-clés. Les réponses restent
+    # volontairement prudentes lorsque les détails exacts ne sont pas connus.
+    if any(word in q for word in ("scrim", "scrims", "match amical", "entrainement contre", "entrainement inter")):
+        return (
+            "🤝 **Les scrims chez Fractale Esport**\n"
+            "Les scrims sont des matchs d'entraînement entre équipes. Pour en organiser, "
+            "présente ton équipe et son niveau dans le salon prévu à cet effet, ou contacte le staff. "
+            "Tu peux aussi chercher des équipes partenaires avec lesquelles t'entraîner."
+        )
+
+    if any(word in q for word in ("tournoi", "competition", "compétition", "inscription", "inscrire", "bracket")):
+        return (
+            "🏆 **Les tournois Fractale Esport**\n"
+            "Le bot prend en charge les formats **1v1, 2v2 et 3v3**. Consulte les annonces et "
+            "les salons de tournois pour connaître les compétitions ouvertes et leurs modalités. "
+            "Si tu as un souci d'inscription, demande de l'aide au staff."
+        )
+
+    if any(word in q for word in ("freestyle", "freestyler", "air dribble", "musty", "flip reset")):
+        return (
+            "🌀 **Freestyle**\n"
+            "Fractale Esport accueille aussi les freestylers ! Tu peux partager tes clips, "
+            "tes créations et échanger avec les autres passionnés dans les salons adaptés."
+        )
+
+    if any(word in q for word in ("rang", "rank", "rocket league", "rlcs", "diamant", "champion", "grand champion", "ssl", "supersonic")):
+        return (
+            "🎮 **Rocket League et les ranks**\n"
+            "Fractale Esport rassemble des joueurs de tous les niveaux, de Moins de diamant "
+            "jusqu'à SSL, ainsi que des freestylers. Consulte les catégories de rang du serveur "
+            "et leurs salons pour trouver les espaces correspondant à ton niveau. "
+            "En cas de problème avec un rôle, contacte un membre du staff."
+        )
+
+    if any(word in q for word in ("rejoindre", "invitation", "invite", "venir sur", "serveur", "discord")):
+        return (
+            "🚀 **Bienvenue sur Fractale Esport !**\n"
+            "Tu peux rejoindre la communauté avec ce lien : https://discord.gg/eaBTAnPZxQ\n"
+            "Une fois sur le serveur, consulte le règlement et les salons d'accueil pour découvrir "
+            "son fonctionnement."
+        )
+
+    if any(word in q for word in ("staff", "moderateur", "moderatrice", "moderation", "fondateur", "cofondateur", "probleme", "plainte", "signaler")):
+        return (
+            "🛡️ **Besoin du staff ?**\n"
+            "Si ta question concerne un problème sur le serveur, un signalement, un rôle ou une "
+            "décision de modération, contacte un modérateur ou utilise le système de signalement prévu."
+        )
+
+    if any(word in q for word in ("partenaire", "partenariat", "equipe", "team", "recrut", "recrutement")):
+        return (
+            "🤝 **Équipes et partenariats**\n"
+            "Fractale Esport recherche des équipes et des partenaires, notamment pour organiser "
+            "des scrims. Présente ton projet au staff dans le salon adapté."
+        )
+
+    return (
+        "🤔 Je n'ai pas encore de réponse fiable à cette question dans ma FAQ.\n"
+        "Un membre du staff pourra t'aider : pense à préciser ta question et le contexte.\n\n"
+        "ℹ️ Je suis actuellement un assistant FAQ gratuit, pas encore une IA générative."
+    )
+
+
+async def _answer_fractale_question(message: discord.Message) -> None:
+    if not AI_CHANNEL_ID or message.channel.id != AI_CHANNEL_ID:
+        return
+    question = (message.content or "").strip()
+    if not question:
+        return
+
+    key = (message.guild.id, message.author.id)
+    now = time.time()
+    previous = _ai_last_answer.get(key, 0)
+    if now - previous < AI_COOLDOWN_SECONDS:
+        return
+    _ai_last_answer[key] = now
+
+    answer = _fractale_faq_answer(question)
+    try:
+        await message.reply(
+            answer,
+            mention_author=False,
+            allowed_mentions=discord.AllowedMentions.none(),
+            suppress_embeds=True,
+        )
+    except (discord.Forbidden, discord.HTTPException):
+        print("[ASSISTANT] Impossible d'envoyer la réponse dans le salon configuré.")
+
+
 async def _log_auto_moderation(guild: discord.Guild, member: discord.Member, reason: str):
     now = int(time.time())
     db.execute(
@@ -3593,6 +3712,8 @@ async def on_message(message: discord.Message):
     member = message.author
     # Les membres ayant une permission de modération ne sont pas filtrés.
     if member.guild_permissions.manage_messages or member.guild_permissions.administrator:
+        # Le salon FAQ fonctionne aussi pour les membres du staff.
+        await _answer_fractale_question(message)
         await bot.process_commands(message)
         return
 
@@ -3616,6 +3737,14 @@ async def on_message(message: discord.Message):
     contains_link = bool(URL_PATTERN.search(content))
     if reason is None and contains_link and message.channel.id not in SALONS_LIENS_AUTORISES:
         reason = "Lien non autorisé dans ce salon. Les liens sont réservés aux salons prévus à cet effet."
+
+    # Anti-mention : bloque les mentions générales et les rafales de mentions.
+    # Le seuil est configurable avec ANTI_MENTION_MAX (5 par défaut).
+    mention_count = len(message.mentions) + len(message.role_mentions)
+    if reason is None and message.mention_everyone and not member.guild_permissions.mention_everyone:
+        reason = "Mention générale (@everyone/@here) non autorisée."
+    if reason is None and mention_count > ANTI_MENTION_MAX:
+        reason = f"Spam de mentions : {mention_count} mentions dans un seul message (maximum : {ANTI_MENTION_MAX})."
 
     # Filtre facultatif configurable par le propriétaire dans le fichier .env.
     if reason is None and MODERATION_MOTS_INTERDITS:
@@ -3651,6 +3780,11 @@ async def on_message(message: discord.Message):
                                "3 incidents de modération automatique en moins d'une heure.")
             except (discord.Forbidden, discord.HTTPException):
                 pass
+
+    # L'assistant ne répond qu'après les contrôles de modération.
+    # Un message supprimé pour infraction ne déclenche donc jamais de réponse FAQ.
+    if reason is None:
+        await _answer_fractale_question(message)
 
     await bot.process_commands(message)
 
@@ -7591,5 +7725,3 @@ if __name__ == "__main__":
         bot.run(TOKEN)
     finally:
         db.close()
-
-    
